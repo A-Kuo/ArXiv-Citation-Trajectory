@@ -25,3 +25,8 @@ quality_report.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Phase 3 outputs
+model_results_summary.json
+MODEL_REPORT.md
+demo_citations.db
