@@ -1,0 +1,118 @@
+{
+  "generated": "2026-04-22T11:36:37.719247",
+  "test_set_results": {
+    "lasso": {
+      "r2": 0.0096398102916464,
+      "mae": 0.8440283281164118,
+      "rmse": 1.0547556518574477,
+      "predictions": null
+    },
+    "ridge": {
+      "r2": -0.0413567897979783,
+      "mae": 0.8664300204721793,
+      "rmse": 1.0815710410173671,
+      "predictions": null
+    },
+    "elasticnet": {
+      "r2": 0.009121807378242752,
+      "mae": 0.8446665218117227,
+      "rmse": 1.0550314581153042,
+      "predictions": null
+    },
+    "gbm": {
+      "r2": -0.04854514287648426,
+      "mae": 0.8776762873364409,
+      "rmse": 1.0852975945587147,
+      "predictions": null
+    }
+  },
+  "calibration": {
+    "residual_std": 0.9614743225260639,
+    "coverage": {
+      "0.68": 0.695,
+      "0.9": 0.8983333333333333,
+      "0.95": 0.9533333333333334,
+      "0.99": 0.9916666666666667
+    }
+  },
+  "velocity": {
+    "citations_first_12mo_mean": 30.095,
+    "citations_second_12mo_mean": 20.063333333333333,
+    "velocity_to_12mo_ratio": 0.6452269925497133,
+    "p75_12mo": 36.0,
+    "p75_24mo": 60.0,
+    "fast_track_papers": 145,
+    "note": "12mo data not available; second-12mo is estimate"
+  },
+  "trends": {
+    "author_analysis": {
+      "1": {
+        "count": 70,
+        "median_citations": 26.0,
+        "mean_citations": 43.785714285714285
+      },
+      "2": {
+        "count": 76,
+        "median_citations": 21.0,
+        "mean_citations": 31.855263157894736
+      },
+      "3": {
+        "count": 87,
+        "median_citations": 25.0,
+        "mean_citations": 48.28735632183908
+      },
+      "4": {
+        "count": 87,
+        "median_citations": 23.0,
+        "mean_citations": 32.91954022988506
+      },
+      "5": {
+        "count": 67,
+        "median_citations": 39.0,
+        "mean_citations": 57.656716417910445
+      },
+      "6": {
+        "count": 79,
+        "median_citations": 34.0,
+        "mean_citations": 66.53164556962025
+      },
+      "7": {
+        "count": 62,
+        "median_citations": 38.5,
+        "mean_citations": 52.67741935483871
+      },
+      "8": {
+        "count": 72,
+        "median_citations": 42.0,
+        "mean_citations": 71.65277777777777
+      }
+    },
+    "keyword_analysis": {
+      "survey": {
+        "papers_with_keyword": 86,
+        "median_citations": 38.0,
+        "mean_citations": 64.51162790697674
+      },
+      "benchmark": {
+        "papers_with_keyword": 89,
+        "median_citations": 27.0,
+        "mean_citations": 47.20224719101124
+      },
+      "state_of_the_art": {
+        "papers_with_keyword": 77,
+        "median_citations": 41.0,
+        "mean_citations": 54.81818181818182
+      },
+      "novel": {
+        "papers_with_keyword": 76,
+        "median_citations": 25.5,
+        "mean_citations": 50.328947368421055
+      },
+      "we_propose": {
+        "papers_with_keyword": 90,
+        "median_citations": 39.0,
+        "mean_citations": 55.455555555555556
+      }
+    }
+  }
+}
