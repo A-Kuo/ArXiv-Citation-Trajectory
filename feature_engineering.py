@@ -4,6 +4,7 @@
 import sqlite3
 import re
 import logging
+import pickle
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
@@ -37,6 +38,7 @@ class FeatureEngineer:
         self.filtering_log = []
         self.feature_log = []
         self.target_log = []
+        self.tfidf_vectorizer = None  # Will be set in extract_text_features if TF-IDF succeeds
 
     def log_filter(self, stage: str, reason: str, count: int, total: int):
         """Log filtering decisions."""
@@ -156,6 +158,8 @@ class FeatureEngineer:
                 )
                 features = pd.concat([features, tfidf_df], axis=1)
                 self.feature_log.append(f"✓ TF-IDF: {len(feature_names)} features (unigrams + bigrams, min_df={min_df_value}, max_features=500)\n")
+                # Store vectorizer for later use (e.g., in Streamlit dashboard)
+                self.tfidf_vectorizer = tfidf
             else:
                 self.feature_log.append(f"⚠ TF-IDF: No features generated (dataset too small)\n")
         except Exception as e:
@@ -329,6 +333,13 @@ def main():
     logger.info(f"Features saved: features.parquet ({features.shape[0]} × {features.shape[1]})")
     logger.info(f"Targets saved: targets.parquet ({targets.shape[0]} × {targets.shape[1]})")
     logger.info(f"ArXiv IDs saved: arxiv_ids.parquet ({arxiv_ids.shape[0]} × {arxiv_ids.shape[1]})")
+
+    # Save TF-IDF vectorizer for Streamlit dashboard use
+    if engineer.tfidf_vectorizer is not None:
+        vectorizer_path = output_dir / "tfidf_vectorizer.pkl"
+        with open(vectorizer_path, "wb") as f:
+            pickle.dump(engineer.tfidf_vectorizer, f)
+        logger.info(f"TF-IDF vectorizer saved: {vectorizer_path}")
 
     report = engineer.generate_report()
     report_path = output_dir / "FEATURE_ENGINEERING_REPORT.md"

@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import logging
+import pickle
 import re
 import sqlite3
 import sys
@@ -23,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LassoCV
+from sklearn.linear_model import LassoCV, Lasso
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -166,6 +167,13 @@ def _make_parquets(db_path: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     targets.to_parquet("targets.parquet", index=False)
     arxiv_ids.to_parquet("arxiv_ids.parquet", index=False)
     log.info(f"Wrote features.parquet {features.shape}, targets.parquet {targets.shape}")
+
+    # Save TF-IDF vectorizer for Streamlit use
+    if eng.tfidf_vectorizer is not None:
+        with open("tfidf_vectorizer.pkl", "wb") as f:
+            pickle.dump(eng.tfidf_vectorizer, f)
+        log.info("TF-IDF vectorizer saved to tfidf_vectorizer.pkl")
+
     return features, targets
 
 
@@ -634,7 +642,25 @@ def main():
         print(f"  Δ R²:                    {confound['delta_r2']:+.4f} ({confound['pct_change']:+.1f}%)")
     print(f"\n  {confound['interpretation']}\n")
 
-    # 5. Write report
+    # 5. Save fitted models for Streamlit dashboard use
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    lasso_final = Lasso(alpha=lasso['best_alpha'], max_iter=10_000)
+    lasso_final.fit(X_scaled, y)
+
+    models_dict = {
+        'scaler': scaler,
+        'lasso': lasso_final,
+        'lasso_coefs': lasso['all_coefs'],
+        'feature_names': col_names,
+        'best_alpha': lasso['best_alpha'],
+    }
+    with open('lasso_model.pkl', 'wb') as f:
+        pickle.dump(models_dict, f)
+    log.info("LASSO model + scaler saved to lasso_model.pkl")
+
+    # 6. Write report
     report_text = generate_report(
         baseline=baseline,
         lasso=lasso,
@@ -646,7 +672,7 @@ def main():
     Path("MODEL_REPORT.md").write_text(report_text)
     log.info("MODEL_REPORT.md written")
 
-    # 6. Save numeric results as JSON for downstream use
+    # 7. Save numeric results as JSON for downstream use
     results = {
         "generated": datetime.now().isoformat(),
         "n_samples": n_samples,

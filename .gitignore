@@ -30,3 +30,7 @@ Thumbs.db
 model_results_summary.json
 MODEL_REPORT.md
 demo_citations.db
+
+# Pickle model files
+lasso_model.pkl
+tfidf_vectorizer.pkl

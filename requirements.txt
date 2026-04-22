@@ -5,5 +5,9 @@ scikit-learn==1.3.2
 textstat==0.7.3
 pyarrow==14.0.1
 
-# Phase 3 — modelling (already satisfied by scikit-learn above)
+# Phase 3 — modelling
 # LassoCV, RandomForestRegressor, cross_val_score, StandardScaler
+
+# Phase 4 — interactive dashboard
+streamlit==1.31.1
+plotly==5.18.0
