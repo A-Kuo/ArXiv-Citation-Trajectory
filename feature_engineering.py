@@ -1,59 +1,72 @@
 #!/usr/bin/env python3
-"""Feature engineering pipeline for ArXiv papers."""
+"""Feature engineering pipeline for ArXiv papers.
 
-import sqlite3
+Connects to the database configured via DATABASE_URL (see pipeline.py).
+Falls back to SQLite for local/demo mode.
+"""
+
+import os
 import re
 import logging
 import pickle
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sqlalchemy import create_engine
 import textstat
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DB_PATH = "citations.db"
+# Legacy constant kept for backward compat with model_results.py --demo
+DB_PATH = os.environ.get("DATABASE_URL", "sqlite:///citations.db")
 OUTPUT_DIR = Path(".")
 
 
+def _make_engine(db_path: str):
+    """Accept either a SQLAlchemy URL or a bare SQLite file path."""
+    if "://" in db_path:
+        url = db_path
+    else:
+        url = f"sqlite:///{db_path}"
+    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+    return create_engine(url, connect_args=connect_args)
+
+
 class FeatureEngineer:
-    """Pipeline for feature engineering from ArXiv papers."""
+    """Pipeline for feature engineering from ArXiv papers.
+
+    Preprocessing steps applied before model training:
+      1. Time-based cutoff  — papers < 24 months old excluded (incomplete citation history)
+      2. Null citations      — rows with missing citations_24mo dropped (no target)
+      3. Invalid text        — rows with empty/missing abstract or title dropped
+      4. NaN imputation      — remaining NaN cells filled with 0.0 before scaling
+      5. StandardScaler      — all features z-scored (mean=0, std=1) for linear models
+    """
 
     def __init__(self, db_path: str = DB_PATH, cutoff_date: Optional[datetime] = None):
-        """Initialize feature engineer.
-
-        Args:
-            db_path: Path to SQLite database
-            cutoff_date: Only include papers submitted before this date to ensure
-                        they have at least 24 months of citation history.
-                        Default: 24 months before today.
-        """
         self.db_path = db_path
-        self.cutoff_date = cutoff_date or (datetime.now() - timedelta(days=365*2))
+        self.cutoff_date = cutoff_date or (datetime.now() - timedelta(days=365 * 2))
         self.filtering_log = []
         self.feature_log = []
         self.target_log = []
-        self.tfidf_vectorizer = None  # Will be set in extract_text_features if TF-IDF succeeds
+        self.tfidf_vectorizer = None
 
     def log_filter(self, stage: str, reason: str, count: int, total: int):
-        """Log filtering decisions."""
         pct = (count / total * 100) if total > 0 else 0
-        msg = f"{stage}: {reason} - Filtered {count} papers ({pct:.1f}% of {total})"
+        msg = f"{stage}: {reason} — filtered {count} ({pct:.1f}% of {total})"
         logger.info(msg)
         self.filtering_log.append(msg)
 
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Load papers and citations from database."""
-        conn = sqlite3.connect(self.db_path)
-        papers = pd.read_sql_query("SELECT * FROM papers", conn)
-        citations = pd.read_sql_query("SELECT * FROM citations", conn)
-        conn.close()
-
+        """Load papers and citations via SQLAlchemy (PostgreSQL / MySQL / SQLite)."""
+        engine = _make_engine(self.db_path)
+        papers = pd.read_sql("SELECT * FROM papers", engine)
+        citations = pd.read_sql("SELECT * FROM citations", engine)
         logger.info(f"Loaded {len(papers)} papers and {len(citations)} citations")
         return papers, citations
 

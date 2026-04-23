@@ -1,85 +1,126 @@
 #!/usr/bin/env python3
-"""Data pipeline for ArXiv papers and citation counts."""
+"""Data pipeline for ArXiv papers and citation counts.
 
-import sqlite3
-import time
+Database backend: PostgreSQL (primary), MySQL, or SQL Server via SQLAlchemy.
+Set the DATABASE_URL environment variable to switch backends:
+
+    PostgreSQL:  postgresql+psycopg2://user:pass@host:5432/citations
+    MySQL:       mysql+pymysql://user:pass@host:3306/citations
+    SQL Server:  mssql+pyodbc://user:pass@host/citations?driver=ODBC+Driver+17+for+SQL+Server
+    SQLite:      sqlite:///citations.db   (demo/local fallback only)
+
+If DATABASE_URL is not set, falls back to SQLite for local testing.
+"""
+
 import json
 import logging
-from datetime import datetime, timedelta
-from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+import os
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import requests
 import numpy as np
 import pandas as pd
+import requests
+from sqlalchemy import (
+    Column, DateTime, ForeignKey, Integer, String, Text,
+    create_engine, text,
+)
+from sqlalchemy.orm import DeclarativeBase, Session, relationship
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-DB_PATH = "citations.db"
+# ---------------------------------------------------------------------------
+# Database configuration
+# ---------------------------------------------------------------------------
+
+_DEFAULT_DB_URL = "sqlite:///citations.db"
 STATE_FILE = "pipeline_state.json"
 
 
+def get_engine(db_url: Optional[str] = None):
+    """Create SQLAlchemy engine from DATABASE_URL env var or explicit url."""
+    url = db_url or os.environ.get("DATABASE_URL", _DEFAULT_DB_URL)
+    connect_args = {}
+    if url.startswith("sqlite"):
+        connect_args["check_same_thread"] = False
+    engine = create_engine(url, connect_args=connect_args, echo=False)
+    logger.info(f"Database engine: {engine.dialect.name} @ {engine.url.database}")
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Paper(Base):
+    __tablename__ = "papers"
+    arxiv_id = Column(String(64), primary_key=True)
+    title = Column(Text)
+    abstract = Column(Text)
+    authors = Column(Text)
+    category = Column(String(32))
+    submitted_date = Column(String(16))
+    citations = relationship("Citation", back_populates="paper", uselist=False)
+
+
+class Citation(Base):
+    __tablename__ = "citations"
+    arxiv_id = Column(String(64), ForeignKey("papers.arxiv_id"), primary_key=True)
+    citations_12mo = Column(Integer)
+    citations_24mo = Column(Integer)
+    fetched_date = Column(String(16))
+    paper = relationship("Paper", back_populates="citations")
+
+
+def init_database(engine=None):
+    """Create tables if they don't exist."""
+    if engine is None:
+        engine = get_engine()
+    Base.metadata.create_all(engine)
+    logger.info("Database schema initialised")
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
 @dataclass
 class RateLimiter:
-    """Simple rate limiter with per-second request tracking."""
+    """Per-key rate limiter tracking last request time."""
     requests_per_second: float
 
     def __post_init__(self):
-        self.last_request_time = {}
+        self.last_request_time: Dict[str, float] = {}
         self.min_interval = 1.0 / self.requests_per_second
 
     def wait(self, key: str = "default"):
-        """Wait until we can make the next request."""
         now = time.time()
-        if key not in self.last_request_time:
-            self.last_request_time[key] = now
-            return
-
-        elapsed = now - self.last_request_time[key]
+        elapsed = now - self.last_request_time.get(key, 0.0)
         wait_time = self.min_interval - elapsed
         if wait_time > 0:
             time.sleep(wait_time)
-
         self.last_request_time[key] = time.time()
 
 
-def init_database():
-    """Initialize SQLite database with required tables."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS papers (
-            arxiv_id TEXT PRIMARY KEY,
-            title TEXT,
-            abstract TEXT,
-            authors TEXT,
-            category TEXT,
-            submitted_date TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS citations (
-            arxiv_id TEXT PRIMARY KEY,
-            citations_12mo INTEGER,
-            citations_24mo INTEGER,
-            fetched_date TEXT,
-            FOREIGN KEY (arxiv_id) REFERENCES papers(arxiv_id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized")
-
+# ---------------------------------------------------------------------------
+# Pipeline state (resume support)
+# ---------------------------------------------------------------------------
 
 def load_state() -> Dict[str, Any]:
-    """Load pipeline state from file."""
     if Path(STATE_FILE).exists():
         with open(STATE_FILE) as f:
             return json.load(f)
@@ -87,20 +128,19 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]):
-    """Save pipeline state to file."""
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
 
-def get_existing_arxiv_ids() -> set:
-    """Get set of arxiv_ids already in database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT arxiv_id FROM papers")
-    ids = {row[0] for row in cursor.fetchall()}
-    conn.close()
-    return ids
+def get_existing_arxiv_ids(engine) -> set:
+    with Session(engine) as session:
+        rows = session.execute(text("SELECT arxiv_id FROM papers")).fetchall()
+    return {r[0] for r in rows}
 
+
+# ---------------------------------------------------------------------------
+# ArXiv fetching
+# ---------------------------------------------------------------------------
 
 def fetch_arxiv_papers(
     categories: List[str],
@@ -108,18 +148,18 @@ def fetch_arxiv_papers(
     end_date: str,
     target_count: int = 5000,
     rate_limiter: Optional[RateLimiter] = None,
+    engine=None,
 ) -> List[Dict[str, Any]]:
-    """Fetch papers from ArXiv API."""
+    """Fetch papers from ArXiv API. Skips papers already in the database."""
     if rate_limiter is None:
         rate_limiter = RateLimiter(1.0)
+    if engine is None:
+        engine = get_engine()
 
-    existing_ids = get_existing_arxiv_ids()
-    papers = []
+    existing_ids = get_existing_arxiv_ids(engine)
+    papers: List[Dict[str, Any]] = []
     base_url = "https://export.arxiv.org/api/query?"
-
-    headers = {
-        "User-Agent": "ArXiv-Citation-Trajectory/1.0 (+https://github.com/a-kuo/arxiv-citation-trajectory)"
-    }
+    headers = {"User-Agent": "ArXiv-Citation-Trajectory/1.0"}
 
     for category in categories:
         start_index = 0
@@ -127,13 +167,15 @@ def fetch_arxiv_papers(
 
         while len(papers) < target_count:
             params = {
-                "search_query": f'cat:{category} AND submittedDate:[{start_date.replace("-", "")}000000 TO {end_date.replace("-", "")}235959]',
+                "search_query": (
+                    f"cat:{category} AND submittedDate:"
+                    f"[{start_date.replace('-','')}000000 TO {end_date.replace('-','')}235959]"
+                ),
                 "start": start_index,
                 "max_results": max_results,
                 "sortBy": "submittedDate",
                 "sortOrder": "ascending",
             }
-
             url = base_url + urllib.parse.urlencode(params)
 
             rate_limiter.wait("arxiv")
@@ -141,18 +183,17 @@ def fetch_arxiv_papers(
                 response = requests.get(url, timeout=30, headers=headers)
                 response.raise_for_status()
             except requests.RequestException as e:
-                logger.warning(f"Error fetching ArXiv (category {category}, offset {start_index}): {e}")
+                logger.warning(f"ArXiv fetch error ({category}, offset {start_index}): {e}")
                 break
 
             try:
                 root = ET.fromstring(response.content)
             except ET.ParseError as e:
-                logger.warning(f"Error parsing ArXiv XML (category {category}, offset {start_index}): {e}")
+                logger.warning(f"ArXiv XML parse error: {e}")
                 break
 
             ns = {"atom": "http://www.w3.org/2005/Atom"}
             entries = root.findall("atom:entry", ns)
-
             if not entries:
                 break
 
@@ -163,291 +204,210 @@ def fetch_arxiv_papers(
                 entry_id = entry.find("atom:id", ns)
                 if entry_id is None:
                     continue
-                arxiv_id = entry_id.text.split('/abs/')[-1]
-
+                arxiv_id = entry_id.text.split("/abs/")[-1]
                 if arxiv_id in existing_ids:
-                    logger.debug(f"Skipping existing paper: {arxiv_id}")
                     continue
 
-                title_elem = entry.find("atom:title", ns)
-                title = title_elem.text if title_elem is not None else ""
-
-                summary_elem = entry.find("atom:summary", ns)
-                summary = summary_elem.text if summary_elem is not None else ""
-
-                authors = []
-                for author in entry.findall("atom:author", ns):
-                    name_elem = author.find("atom:name", ns)
-                    if name_elem is not None:
-                        authors.append(name_elem.text)
-                authors_str = ", ".join(authors)
-
-                published_elem = entry.find("atom:published", ns)
-                submitted_date = published_elem.text[:10] if published_elem is not None else ""
+                title = getattr(entry.find("atom:title", ns), "text", "") or ""
+                abstract = getattr(entry.find("atom:summary", ns), "text", "") or ""
+                authors = ", ".join(
+                    getattr(a.find("atom:name", ns), "text", "")
+                    for a in entry.findall("atom:author", ns)
+                )
+                submitted_date = (getattr(entry.find("atom:published", ns), "text", "") or "")[:10]
 
                 papers.append({
                     "arxiv_id": arxiv_id,
                     "title": title,
-                    "abstract": summary,
-                    "authors": authors_str,
+                    "abstract": abstract,
+                    "authors": authors,
                     "category": category,
                     "submitted_date": submitted_date,
                 })
 
             start_index += max_results
-            logger.info(f"Fetched {len(papers)} papers from {category} so far...")
+            logger.info(f"  [{category}] fetched {len(papers)} papers so far...")
 
-    logger.info(f"Fetched {len(papers)} papers total from ArXiv")
+    logger.info(f"Total papers fetched from ArXiv: {len(papers)}")
     return papers
 
 
-def store_papers(papers: List[Dict[str, Any]]):
-    """Store papers in database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+def store_papers(papers: List[Dict[str, Any]], engine=None):
+    """Upsert papers into the database."""
+    if engine is None:
+        engine = get_engine()
+    stored = 0
+    with Session(engine) as session:
+        for p in papers:
+            existing = session.get(Paper, p["arxiv_id"])
+            if existing is None:
+                session.add(Paper(**p))
+                stored += 1
+        session.commit()
+    logger.info(f"Stored {stored} new papers ({len(papers) - stored} already existed)")
 
-    for paper in papers:
-        try:
-            cursor.execute(
-                """
-                INSERT INTO papers (arxiv_id, title, abstract, authors, category, submitted_date)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    paper["arxiv_id"],
-                    paper["title"],
-                    paper["abstract"],
-                    paper["authors"],
-                    paper["category"],
-                    paper["submitted_date"],
-                ),
-            )
-        except sqlite3.IntegrityError:
-            logger.debug(f"Paper {paper['arxiv_id']} already exists")
 
-    conn.commit()
-    conn.close()
-    logger.info(f"Stored {len(papers)} papers in database")
-
+# ---------------------------------------------------------------------------
+# OpenAlex citation fetching
+# ---------------------------------------------------------------------------
 
 def fetch_openalex_citations(
     arxiv_id: str,
     submitted_date: str,
     rate_limiter: Optional[RateLimiter] = None,
 ) -> Optional[Dict[str, int]]:
-    """Fetch citation counts from OpenAlex API."""
     if rate_limiter is None:
         rate_limiter = RateLimiter(10.0)
 
     rate_limiter.wait("openalex")
-
     try:
-        url = "https://api.openalex.org/works"
-        params = {
-            "filter": f"arxiv:{arxiv_id}",
-            "per_page": 1,
-        }
-
-        response = requests.get(url, params=params, timeout=30)
+        response = requests.get(
+            "https://api.openalex.org/works",
+            params={"filter": f"arxiv:{arxiv_id}", "per_page": 1},
+            timeout=30,
+        )
         response.raise_for_status()
-        data = response.json()
-
-        if not data.get("results"):
-            logger.debug(f"No OpenAlex data for {arxiv_id}")
+        results = response.json().get("results", [])
+        if not results:
             return None
 
-        work = data["results"][0]
-        publication_date = work.get("publication_date")
-        cited_by_count = work.get("cited_by_count", 0)
-
-        if not publication_date:
-            publication_date = submitted_date
-
+        work = results[0]
         submission_dt = datetime.strptime(submitted_date, "%Y-%m-%d")
-        citations_12mo = count_citations_until(work, submission_dt, 12)
-        citations_24mo = count_citations_until(work, submission_dt, 24)
-
         return {
-            "citations_12mo": citations_12mo,
-            "citations_24mo": citations_24mo,
+            "citations_12mo": _count_citations_within(work, submission_dt, months=12),
+            "citations_24mo": _count_citations_within(work, submission_dt, months=24),
         }
-
     except requests.RequestException as e:
-        logger.warning(f"Error fetching OpenAlex data for {arxiv_id}: {e}")
+        logger.warning(f"OpenAlex fetch error for {arxiv_id}: {e}")
         return None
 
 
-def count_citations_until(work: Dict, submission_dt: datetime, months: int) -> int:
-    """Estimate citations within N months of submission."""
+def _count_citations_within(work: Dict, submission_dt: datetime, months: int) -> int:
     cited_by_count = work.get("cited_by_count", 0)
-
     if not cited_by_count:
         return 0
-
     cutoff_dt = submission_dt + timedelta(days=30 * months)
-    publication_date = work.get("publication_date", submission_dt.isoformat()[:10])
-
-    if publication_date:
-        try:
-            pub_dt = datetime.strptime(publication_date[:10], "%Y-%m-%d")
-        except (ValueError, TypeError):
-            pub_dt = submission_dt
-    else:
+    pub_str = work.get("publication_date") or submission_dt.isoformat()[:10]
+    try:
+        pub_dt = datetime.strptime(pub_str[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
         pub_dt = submission_dt
-
-    if pub_dt > cutoff_dt:
-        return 0
-
-    return cited_by_count
+    return 0 if pub_dt > cutoff_dt else cited_by_count
 
 
-def fetch_all_citations(rate_limiter: Optional[RateLimiter] = None):
-    """Fetch citations for all papers in database."""
+def fetch_all_citations(engine=None, rate_limiter: Optional[RateLimiter] = None):
+    """Fetch and store citation counts for all papers not yet covered."""
+    if engine is None:
+        engine = get_engine()
     if rate_limiter is None:
         rate_limiter = RateLimiter(10.0)
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    with Session(engine) as session:
+        rows = session.execute(text(
+            "SELECT p.arxiv_id, p.submitted_date FROM papers p "
+            "WHERE p.arxiv_id NOT IN (SELECT arxiv_id FROM citations)"
+        )).fetchall()
 
-    cursor.execute("""
-        SELECT p.arxiv_id, p.submitted_date
-        FROM papers p
-        WHERE p.arxiv_id NOT IN (SELECT arxiv_id FROM citations)
-    """)
+    logger.info(f"Fetching citations for {len(rows)} papers without citation data")
 
-    papers_to_fetch = cursor.fetchall()
-    conn.close()
-
-    logger.info(f"Fetching citations for {len(papers_to_fetch)} papers")
-
-    for i, (arxiv_id, submitted_date) in enumerate(papers_to_fetch, 1):
+    for i, (arxiv_id, submitted_date) in enumerate(rows, 1):
         result = fetch_openalex_citations(arxiv_id, submitted_date, rate_limiter)
-
         if result:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO citations (arxiv_id, citations_12mo, citations_24mo, fetched_date)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    arxiv_id,
-                    result["citations_12mo"],
-                    result["citations_24mo"],
-                    datetime.now().isoformat()[:10],
-                ),
-            )
-            conn.commit()
-            conn.close()
-
+            with Session(engine) as session:
+                existing = session.get(Citation, arxiv_id)
+                if existing is None:
+                    session.add(Citation(
+                        arxiv_id=arxiv_id,
+                        citations_12mo=result["citations_12mo"],
+                        citations_24mo=result["citations_24mo"],
+                        fetched_date=datetime.now().isoformat()[:10],
+                    ))
+                    session.commit()
         if i % 100 == 0:
-            logger.info(f"Fetched citations for {i}/{len(papers_to_fetch)} papers")
+            logger.info(f"  Progress: {i}/{len(rows)} papers")
 
     logger.info("Citation fetching completed")
 
 
-def generate_quality_report():
-    """Generate data quality report."""
-    conn = sqlite3.connect(DB_PATH)
+# ---------------------------------------------------------------------------
+# Quality report
+# ---------------------------------------------------------------------------
 
-    papers_df = pd.read_sql_query("SELECT * FROM papers", conn)
-    citations_df = pd.read_sql_query("SELECT * FROM citations", conn)
+def generate_quality_report(engine=None):
+    if engine is None:
+        engine = get_engine()
+
+    papers_df = pd.read_sql("SELECT * FROM papers", engine)
+    citations_df = pd.read_sql("SELECT * FROM citations", engine)
     merged_df = papers_df.merge(citations_df, on="arxiv_id", how="left")
 
-    conn.close()
+    lines = [
+        "\n" + "=" * 60,
+        "DATA QUALITY REPORT",
+        "=" * 60,
+        f"\nTotal papers: {len(papers_df)}",
+        f"Papers with citation data: {len(citations_df)}",
+    ]
+    if len(papers_df):
+        lines.append(f"Coverage: {len(citations_df) / len(papers_df) * 100:.1f}%")
 
-    report = []
-    report.append("\n" + "="*60)
-    report.append("DATA QUALITY REPORT")
-    report.append("="*60)
+    lines.append("\nNULL RATES:")
+    for col in ["title", "abstract", "authors", "citations_12mo", "citations_24mo"]:
+        df = papers_df if col in papers_df.columns else merged_df
+        null_pct = df[col].isna().sum() / len(df) * 100
+        lines.append(f"  {col}: {null_pct:.2f}%")
 
-    report.append(f"\nTotal papers: {len(papers_df)}")
-    report.append(f"Papers with citations data: {len(citations_df)}")
-    if len(papers_df) > 0:
-        report.append(f"Citation data coverage: {len(citations_df) / len(papers_df) * 100:.1f}%")
+    for label, col in [("12-month", "citations_12mo"), ("24-month", "citations_24mo")]:
+        data = citations_df[col].dropna()
+        if len(data):
+            lines.extend([
+                f"\n{label.upper()} CITATION DISTRIBUTION (n={len(data)}):",
+                f"  Mean:   {data.mean():.2f}",
+                f"  Median: {data.median():.2f}",
+                f"  Std:    {data.std():.2f}",
+                f"  P25:    {data.quantile(0.25):.2f}",
+                f"  P75:    {data.quantile(0.75):.2f}",
+                f"  P90:    {data.quantile(0.90):.2f}",
+                f"  P99:    {data.quantile(0.99):.2f}",
+            ])
 
-    report.append("\nNULL RATES:")
-    for col in ["title", "abstract", "authors"]:
-        if col in papers_df.columns:
-            null_rate = papers_df[col].isna().sum() / len(papers_df) * 100
-            report.append(f"  {col}: {null_rate:.2f}%")
+    lines.append("\nPAPERS PER CATEGORY:")
+    for cat, n in papers_df["category"].value_counts().sort_index().items():
+        lines.append(f"  {cat}: {n}")
 
-    for col in ["citations_12mo", "citations_24mo"]:
-        if col in merged_df.columns:
-            null_rate = merged_df[col].isna().sum() / len(merged_df) * 100
-            report.append(f"  {col}: {null_rate:.2f}%")
+    lines.append("\nDATE COVERAGE:")
+    lines.append(f"  Earliest: {papers_df['submitted_date'].min()}")
+    lines.append(f"  Latest:   {papers_df['submitted_date'].max()}")
+    lines.append("\n" + "=" * 60 + "\n")
 
-    report.append("\nCITATION DISTRIBUTION:")
-    cit_12 = citations_df["citations_12mo"].dropna()
-    cit_24 = citations_df["citations_24mo"].dropna()
-
-    if len(cit_12) > 0:
-        report.append(f"  12-month citations:")
-        report.append(f"    Mean: {cit_12.mean():.2f}")
-        report.append(f"    Median: {cit_12.median():.2f}")
-        report.append(f"    P90: {cit_12.quantile(0.90):.2f}")
-        report.append(f"    P99: {cit_12.quantile(0.99):.2f}")
-
-    if len(cit_24) > 0:
-        report.append(f"  24-month citations:")
-        report.append(f"    Mean: {cit_24.mean():.2f}")
-        report.append(f"    Median: {cit_24.median():.2f}")
-        report.append(f"    P90: {cit_24.quantile(0.90):.2f}")
-        report.append(f"    P99: {cit_24.quantile(0.99):.2f}")
-
-    report.append("\nPAPERS PER CATEGORY:")
-    if len(papers_df) > 0:
-        category_counts = papers_df["category"].value_counts().sort_index()
-        for category, count in category_counts.items():
-            report.append(f"  {category}: {count}")
-
-    report.append("\nDATE COVERAGE:")
-    if len(papers_df) > 0:
-        report.append(f"  Earliest: {papers_df['submitted_date'].min()}")
-        report.append(f"  Latest: {papers_df['submitted_date'].max()}")
-
-    report.append("\n" + "="*60 + "\n")
-
-    report_text = "\n".join(report)
+    report_text = "\n".join(lines)
     print(report_text)
-
-    with open("quality_report.txt", "w") as f:
-        f.write(report_text)
-
+    Path("quality_report.txt").write_text(report_text)
     logger.info("Quality report saved to quality_report.txt")
 
 
-def main():
-    """Run the complete pipeline."""
-    logger.info("Starting data pipeline")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    init_database()
+def main():
+    engine = init_database()
 
     arxiv_limiter = RateLimiter(1.0)
     openalex_limiter = RateLimiter(10.0)
 
-    categories = ["cs.LG", "cs.AI", "econ.GN", "stat.ML"]
-    start_date = "2019-01-01"
-    end_date = "2022-12-31"
-
-    logger.info(f"Fetching papers from {start_date} to {end_date}")
     papers = fetch_arxiv_papers(
-        categories,
-        start_date,
-        end_date,
+        categories=["cs.LG", "cs.AI", "econ.GN", "stat.ML"],
+        start_date="2019-01-01",
+        end_date="2022-12-31",
         target_count=5000,
         rate_limiter=arxiv_limiter,
+        engine=engine,
     )
 
-    logger.info(f"Storing {len(papers)} papers")
-    store_papers(papers)
-
-    logger.info("Fetching citations from OpenAlex")
-    fetch_all_citations(rate_limiter=openalex_limiter)
-
-    logger.info("Generating quality report")
-    generate_quality_report()
+    store_papers(papers, engine=engine)
+    fetch_all_citations(engine=engine, rate_limiter=openalex_limiter)
+    generate_quality_report(engine=engine)
 
     logger.info("Pipeline completed successfully")
 
