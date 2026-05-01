@@ -19,3 +19,10 @@ lightgbm>=4.0.0
 # Phase 4 — interactive dashboard
 streamlit==1.31.1
 plotly==5.18.0
+
+# Phase 5 — Testing and API
+pytest>=7.0.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0.0
+httpx>=0.24.0  # For testing FastAPI endpoints
