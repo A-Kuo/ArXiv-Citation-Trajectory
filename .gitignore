@@ -1,0 +1,47 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# Pipeline outputs
+citations.db
+pipeline_state.json
+quality_report.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Phase 3 outputs
+model_results_summary.json
+MODEL_REPORT.md
+demo_citations.db
+
+# Phase 4+ runtime outputs
+FEATURE_ENGINEERING_REPORT.md
+ADVANCED_ANALYSIS_REPORT.md
+advanced_analysis_summary.json
+metrics_deep_dive.json
+
+# Pickle model files
+lasso_model.pkl
+tfidf_vectorizer.pkl
+
+# Parquet feature/target files
+features.parquet
+targets.parquet
+arxiv_ids.parquet
