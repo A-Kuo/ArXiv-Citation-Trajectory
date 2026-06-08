@@ -1,103 +1,129 @@
-# ArXiv Citation Trajectory Data Pipeline
+# ArXiv Citation Trajectory
 
-A comprehensive data pipeline to fetch papers from ArXiv and their citation counts from OpenAlex, with built-in rate limiting, resume capability, and data quality reporting.
+Predicts the 24-month citation impact of arXiv papers using a full ML pipeline — from data collection through a REST API and interactive dashboard.
 
-## Features
+**Stack:** Python · FastAPI · Streamlit · scikit-learn · SQLite · pytest
 
-- **ArXiv API Integration**: Queries papers in cs.LG, cs.AI, econ.GN, and stat.ML categories (2019-2022)
-- **OpenAlex API Integration**: Fetches citation counts at 12 and 24 months post-submission
-- **SQLite Database**: Persistent storage with two tables: papers and citations
-- **Rate Limiting**: 1 req/sec for ArXiv, 10 req/sec for OpenAlex
-- **Resume Capability**: Skips papers already in database, continues from where it left off
-- **Data Quality Report**: Summary statistics on null rates, citation distribution, category coverage, date ranges
+---
 
-## Installation
+## Overview
+
+| Phase | What it does |
+|-------|-------------|
+| **1 — Data pipeline** | Fetches ~5,000 papers (2019–2022) from arXiv API; enriches with 12-month and 24-month citation counts from OpenAlex |
+| **2 — Feature engineering** | Extracts text (TF-IDF), metadata, and abstract quality signals; handles nulls, standardises |
+| **3 — ML models** | Trains LASSO, Ridge, ElasticNet, Gradient Boosting; compares on held-out test set with calibrated confidence intervals |
+| **4 — Dashboard & API** | Streamlit dashboard for interactive analysis; FastAPI REST endpoint for single and batch predictions |
+
+---
+
+## Quick start
 
 ```bash
 pip install -r requirements.txt
+
+# 1. Collect data (~40 min, rate-limited)
+python pipeline.py
+
+# 2. Build features and train models
+python feature_engineering.py
+python model_results.py
+
+# 3. Launch dashboard
+streamlit run streamlit_app.py
+
+# 4. Launch REST API
+python api.py          # → http://localhost:8000
+                       # → http://localhost:8000/docs  (interactive docs)
 ```
 
-## Usage
+---
 
-Run the complete pipeline:
+## REST API
+
+```
+GET  /health            Health check
+GET  /model/info        Model metadata and feature list
+POST /predict           Single-paper prediction
+POST /predict/batch     Batch prediction (up to 100 papers)
+```
+
+Example:
 
 ```bash
-python pipeline.py
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Attention Is All You Need", "abstract": "...", "category": "cs.LG", "num_authors": 8}'
 ```
 
-The pipeline will:
-1. Fetch ~5,000 papers from ArXiv (2019-2022)
-2. Query OpenAlex for citation counts
-3. Store all data in `citations.db`
-4. Generate and print a quality report
-5. Save the report to `quality_report.txt`
+Returns predicted 24-month citation count with 95% confidence interval.
 
-## Database Schema
+---
 
-### papers table
-- `arxiv_id` (TEXT, PRIMARY KEY): ArXiv identifier
-- `title` (TEXT): Paper title
-- `abstract` (TEXT): Paper abstract
-- `authors` (TEXT): Comma-separated authors
-- `category` (TEXT): ArXiv category
-- `submitted_date` (TEXT): Submission date (YYYY-MM-DD)
+## Model performance
 
-### citations table
-- `arxiv_id` (TEXT, PRIMARY KEY): ArXiv identifier
-- `citations_12mo` (INTEGER): Citation count within 12 months
-- `citations_24mo` (INTEGER): Citation count within 24 months
-- `fetched_date` (TEXT): When the citation data was fetched
+Evaluated on a 20% holdout set (log-scale targets):
 
-## Resume Capability
+| Model | Test R² | Test MAE |
+|-------|---------|----------|
+| LASSO | 0.010 | 0.844 |
+| Ridge | −0.041 | 0.866 |
+| ElasticNet | 0.009 | 0.845 |
+| Gradient Boosting | −0.049 | 0.878 |
 
-The pipeline automatically detects papers already in the database and skips them. This allows:
-- Resuming interrupted runs without re-fetching
-- Incrementally adding new data
-- Running multiple pipeline instances safely
+Confidence intervals are empirically calibrated (95% nominal → 95.3% empirical coverage).
 
-## Rate Limiting
+See [`ADVANCED_ANALYSIS_REPORT.md`](ADVANCED_ANALYSIS_REPORT.md) for full metrics: citation velocity, author-count effects, keyword performance, and stratified breakdowns.
 
-To avoid overloading the APIs:
-- **ArXiv**: 1 request per second (as per API guidelines)
-- **OpenAlex**: 10 requests per second (API allows higher but we're conservative)
+---
 
-The RateLimiter class ensures smooth request distribution.
+## Project structure
 
-## Output
+```
+pipeline.py               Data collection (arXiv + OpenAlex)
+feature_engineering.py    Feature extraction and preprocessing
+model_results.py          Model training, evaluation, comparison
+advanced_analysis.py      Stratified metrics, confidence calibration
+metrics_deep_dive.py      Granular performance breakdowns
+api.py                    FastAPI REST server
+streamlit_app.py          Interactive Streamlit dashboard
+streamlit_app_enhanced.py Dashboard with SHAP-like explanations and batch analysis
+demo.py                   Quick single-prediction demo
+demo_full_pipeline.py     End-to-end pipeline demo
+tests/                    pytest test suite
+```
 
-The pipeline generates:
-- `citations.db`: SQLite database with all papers and citations
-- `quality_report.txt`: Data quality statistics
-- Console output with progress logs
+---
 
-## Quality Report Contents
+## Database schema
 
-- Total paper count and citation coverage
-- Null rates for key fields
-- Citation distribution (mean, median, P90, P99)
-- Papers per category breakdown
-- Date coverage (earliest to latest submission)
+SQLite (`citations.db`), two tables:
+
+**papers** — `arxiv_id`, `title`, `abstract`, `authors`, `category`, `submitted_date`
+
+**citations** — `arxiv_id`, `citations_12mo`, `citations_24mo`, `fetched_date`
+
+PostgreSQL is also supported; set `DB_URL` env var to a Postgres connection string.
+
+---
+
+## Testing
+
+```bash
+pytest tests/ -v
+```
+
+Coverage includes pipeline unit tests, feature engineering, and model evaluation checks.
+
+---
 
 ## Configuration
 
-To modify the pipeline, edit these variables in `pipeline.py`:
-- `DB_PATH`: Database file location (default: `citations.db`)
-- `STATE_FILE`: Pipeline state file (default: `pipeline_state.json`)
-- `categories`: ArXiv categories to fetch
-- `start_date` / `end_date`: Date range for paper selection
-- `target_count`: Target number of papers to fetch
+Key variables in `pipeline.py`:
 
-## Performance Notes
-
-- Full pipeline run (5,000 papers) takes approximately:
-  - ArXiv fetch: ~30 minutes (rate-limited to 1 req/sec)
-  - OpenAlex fetch: ~8 minutes (rate-limited to 10 req/sec)
-  - Database operations: ~1 minute
-  - Total: ~40 minutes
-
-## Error Handling
-
-- Network errors are logged and skipped (pipeline continues)
-- Duplicate papers are silently skipped
-- Missing OpenAlex data is handled gracefully
-- All errors are logged for debugging
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_PATH` | `citations.db` | SQLite database path |
+| `categories` | cs.LG, cs.AI, econ.GN, stat.ML | arXiv categories |
+| `start_date` / `end_date` | 2019-01-01 / 2022-12-31 | Date range |
+| `target_count` | 5000 | Papers to fetch |
