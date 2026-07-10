@@ -15,7 +15,7 @@ import os
 import pickle
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 
 import numpy as np
@@ -25,6 +25,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+from feature_schema import FeatureBuilder, load_builder_from_training_artifacts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,6 +60,7 @@ _MODEL_STATE = {
     "scaler": None,
     "feature_names": None,
     "tfidf_vectorizer": None,
+    "builder": None,
     "ready": False,
     "load_time": None,
 }
@@ -71,16 +74,36 @@ class PaperInput(BaseModel):
     """Single paper for prediction."""
     title: str = Field(..., min_length=3, max_length=500, description="Paper title")
     abstract: str = Field(..., min_length=20, max_length=5000, description="Paper abstract")
-    authors: Optional[int] = Field(default=1, ge=1, le=100, description="Number of authors")
+    authors: Optional[Union[int, str]] = Field(
+        default=1, description="Number of authors (int) or comma-separated author list (str)"
+    )
     category: Optional[str] = Field(default="cs.LG", description="ArXiv category (cs.LG, cs.AI, stat.ML, econ.GN)")
-    
+    submitted_date: Optional[str] = Field(
+        default=None,
+        description=(
+            "ISO 8601 date the paper was submitted (e.g. '2023-06-15'). "
+            "If omitted, the current date is used, which introduces "
+            "train/serve skew for the submission_month/submission_year "
+            "features — provide this whenever the real date is known."
+        ),
+    )
+
+    @validator("submitted_date")
+    def _parse_submitted_date(cls, v):
+        if v is None:
+            return v
+        # Validate parseability early so bad input fails at the API boundary.
+        datetime.fromisoformat(v)
+        return v
+
     class Config:
         schema_extra = {
             "example": {
                 "title": "Attention is All You Need",
                 "abstract": "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks...",
                 "authors": 8,
-                "category": "cs.LG"
+                "category": "cs.LG",
+                "submitted_date": "2017-06-12"
             }
         }
 
@@ -97,6 +120,10 @@ class PredictionOutput(BaseModel):
     percentile: float = Field(..., ge=0, le=100, description="Estimated percentile rank (0-100)")
     confidence_interval_lower: float = Field(..., description="95% CI lower bound (log scale)")
     confidence_interval_upper: float = Field(..., description="95% CI upper bound (log scale)")
+    validation_warnings: List[str] = Field(
+        default_factory=list,
+        description="Feature-construction warnings (e.g. missing submitted_date, unknown category)",
+    )
 
 
 class BatchPredictionOutput(BaseModel):
@@ -150,7 +177,15 @@ def load_model():
         if TFIDF_VECTORIZER_PATH.exists():
             with open(TFIDF_VECTORIZER_PATH, "rb") as f:
                 _MODEL_STATE["tfidf_vectorizer"] = pickle.load(f)
-        
+
+        # Shared feature builder — guarantees the API constructs features
+        # the same way feature_engineering.py did at training time.
+        _MODEL_STATE["builder"] = load_builder_from_training_artifacts(
+            model_path=MODEL_PATH,
+            vectorizer_path=TFIDF_VECTORIZER_PATH,
+            validation_mode="warn",
+        )
+
         _MODEL_STATE["ready"] = True
         logger.info(f"Model loaded successfully from {MODEL_PATH}")
         logger.info(f"Features: {len(_MODEL_STATE['feature_names'])}")
@@ -176,54 +211,22 @@ def ensure_model_loaded():
 # ============================================================================
 
 def extract_features_from_paper(paper: PaperInput) -> np.ndarray:
-    """Extract features from paper metadata and text."""
-    features = {}
-    
-    # Basic metadata
-    features['abstract_length'] = len(paper.abstract.split())
-    features['title_length'] = len(paper.title.split())
-    features['author_count'] = paper.authors
-    
-    # Readability (simplified)
-    avg_word_length = np.mean([len(w) for w in paper.abstract.split()])
-    features['flesch_reading_ease'] = 206.835 - 1.015 * (len(paper.abstract.split()) / len(paper.abstract.split())) - 84.6 * (avg_word_length / 1.0)
-    features['flesch_reading_ease'] = max(0, min(100, features['flesch_reading_ease']))
-    
-    # Signal detection
-    text_lower = (paper.title + " " + paper.abstract).lower()
-    features['equation_count'] = text_lower.count('$')
-    features['has_survey'] = 1 if 'survey' in text_lower else 0
-    features['has_benchmark'] = 1 if 'benchmark' in text_lower else 0
-    features['has_novel'] = 1 if 'novel' in text_lower else 0
-    
-    # Category one-hot
-    categories = ['cs.LG', 'cs.AI', 'stat.ML', 'econ.GN']
-    for cat in categories:
-        features[f'cat_{cat}'] = 1 if paper.category == cat else 0
-    
-    # Submission timing (assume current year/month for API)
-    import datetime as dt
-    now = dt.datetime.now()
-    features['submission_month'] = now.month
-    features['submission_year'] = now.year
-    
-    # Stub TF-IDF features (all zeros if vectorizer not loaded)
-    if _MODEL_STATE["tfidf_vectorizer"] is not None:
-        tfidf_vector = _MODEL_STATE["tfidf_vectorizer"].transform([paper.abstract + " " + paper.title]).toarray()[0]
-        for i, val in enumerate(tfidf_vector):
-            features[f'tfidf_feature_{i}'] = val
-    else:
-        # Add placeholder zeros for all expected TF-IDF features
-        for name in _MODEL_STATE["feature_names"]:
-            if name.startswith("tfidf_"):
-                features[name] = 0.0
-    
-    # Ensure all expected features exist
-    feature_vector = np.zeros(len(_MODEL_STATE["feature_names"]))
-    for i, fname in enumerate(_MODEL_STATE["feature_names"]):
-        feature_vector[i] = features.get(fname, 0.0)
-    
-    return feature_vector.reshape(1, -1)
+    """DEPRECATED: use FeatureBuilder (feature_schema.py) via predict_single()
+    instead. This manual reconstruction diverged from feature_engineering.py
+    training-time features (missing citation_count, incorrect Flesch formula,
+    incomplete keyword/category coverage, always used today's date instead of
+    the paper's submitted_date). Kept only for one release as a migration
+    aid; do not call this in new code.
+    """
+    builder: FeatureBuilder = _MODEL_STATE["builder"]
+    vector, _ = builder.build_feature_vector(
+        title=paper.title,
+        abstract=paper.abstract,
+        authors=paper.authors,
+        category=paper.category,
+        submitted_date=datetime.fromisoformat(paper.submitted_date) if paper.submitted_date else None,
+    )
+    return vector
 
 
 # ============================================================================
@@ -231,36 +234,52 @@ def extract_features_from_paper(paper: PaperInput) -> np.ndarray:
 # ============================================================================
 
 def predict_single(paper: PaperInput) -> PredictionOutput:
-    """Predict citations for a single paper."""
+    """Predict citations for a single paper.
+
+    Features are built via the shared FeatureBuilder (feature_schema.py) so
+    the API constructs the exact same feature vector feature_engineering.py
+    would have produced at training time — same field formulas, same
+    dynamic category set, same TF-IDF term alignment.
+    """
     ensure_model_loaded()
-    
-    # Extract features
-    X = extract_features_from_paper(paper)
-    
+
+    builder: FeatureBuilder = _MODEL_STATE["builder"]
+    X, validation_log = builder.build_feature_vector(
+        title=paper.title,
+        abstract=paper.abstract,
+        authors=paper.authors,
+        category=paper.category,
+        submitted_date=datetime.fromisoformat(paper.submitted_date) if paper.submitted_date else None,
+    )
+    warnings = [msg for level, msg in validation_log if level == "warning"]
+    for msg in warnings:
+        logger.warning(f"Feature construction warning: {msg}")
+
     # Scale
     X_scaled = _MODEL_STATE["scaler"].transform(X)
-    
+
     # Predict
     y_pred_log = _MODEL_STATE["model"].predict(X_scaled)[0]
     y_pred_raw = np.expm1(y_pred_log)
-    
+
     # Estimate confidence interval (±0.5 on log scale)
     ci_lower = y_pred_log - 0.5
     ci_upper = y_pred_log + 0.5
-    
+
     # Estimate percentile (assume normal distribution on log scale)
     from scipy.stats import norm
     mean_log = 3.28  # From Y statistics
     std_log = 0.99
     percentile = norm.cdf(y_pred_log, loc=mean_log, scale=std_log) * 100
     percentile = max(0, min(100, percentile))  # Clamp to [0, 100]
-    
+
     return PredictionOutput(
         predicted_citations_log=float(y_pred_log),
         predicted_citations_raw=float(max(0, y_pred_raw)),
         percentile=float(percentile),
         confidence_interval_lower=float(ci_lower),
         confidence_interval_upper=float(ci_upper),
+        validation_warnings=warnings,
     )
 
 

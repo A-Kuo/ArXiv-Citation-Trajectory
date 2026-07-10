@@ -10,6 +10,7 @@ import pickle
 import json
 from pathlib import Path
 from io import BytesIO
+from datetime import datetime
 import csv
 
 import numpy as np
@@ -19,6 +20,8 @@ import plotly.express as px
 import streamlit as st
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
+
+from feature_schema import load_builder_from_training_artifacts
 
 st.set_page_config(page_title="ArXiv Citation Analysis (Enhanced)", layout="wide")
 st.title("📊 ArXiv Citation Analysis — Enhanced Edition")
@@ -47,6 +50,15 @@ def load_assets():
         with open("advanced_analysis_summary.json") as f:
             advanced_analysis = json.load(f)
 
+    # Shared feature builder — constructs single-paper features the same
+    # way feature_engineering.py did at training time, so predictions here
+    # match the API and the trained model's expectations.
+    builder = load_builder_from_training_artifacts(
+        model_path=Path("lasso_model.pkl"),
+        vectorizer_path=Path("tfidf_vectorizer.pkl"),
+        validation_mode="warn",
+    )
+
     return {
         'features': features,
         'targets': targets,
@@ -57,6 +69,7 @@ def load_assets():
         'lasso_coefs': models['lasso_coefs'],
         'feature_names': models['feature_names'],
         'advanced': advanced_analysis,
+        'builder': builder,
     }
 
 try:
@@ -75,6 +88,7 @@ lasso_model = assets['lasso']
 lasso_coefs = assets['lasso_coefs']
 feature_names = assets['feature_names']
 advanced = assets['advanced']
+builder = assets['builder']
 
 # ===========================================================================
 # Sidebar navigation
@@ -98,22 +112,29 @@ page = st.sidebar.radio(
 # Helper: predict from abstract
 # ===========================================================================
 
-def predict_from_abstract(title: str, abstract: str) -> dict:
-    """Predict citations for a single abstract."""
-    combined_text = (title + " " + abstract).lower()
+def predict_from_abstract(
+    title: str,
+    abstract: str,
+    authors=None,
+    category: str = None,
+    submitted_date=None,
+) -> dict:
+    """Predict citations for a single abstract.
 
+    Uses the shared FeatureBuilder so metadata features (author count,
+    submission date, category, keyword flags) are actually computed from
+    the input instead of falling back to training-set medians — the
+    previous version discarded that signal entirely.
+    """
     try:
-        tfidf_features = tfidf_vec.transform([combined_text])
-        tfidf_names = [f"tfidf_{name}" for name in tfidf_vec.get_feature_names_out()]
-
-        # Build feature vector
-        X_user = np.zeros((1, len(feature_names)))
-        for i, fname in enumerate(feature_names):
-            if fname in tfidf_names:
-                idx = tfidf_names.index(fname)
-                X_user[0, i] = tfidf_features[0, idx]
-            elif fname not in tfidf_names and not fname.startswith("tfidf_"):
-                X_user[0, i] = features[fname].median() if fname in features.columns else 0.0
+        X_user, validation_log = builder.build_feature_vector(
+            title=title,
+            abstract=abstract,
+            authors=authors,
+            category=category,
+            submitted_date=submitted_date,
+        )
+        warnings = [msg for level, msg in validation_log if level == "warning"]
 
         X_user_scaled = scaler.transform(X_user)
         pred_log = lasso_model.predict(X_user_scaled)[0]
@@ -134,6 +155,7 @@ def predict_from_abstract(title: str, abstract: str) -> dict:
             'conf_lower': conf_lower,
             'conf_upper': conf_upper,
             'std_error': std_error,
+            'warnings': warnings,
         }
     except Exception as e:
         return {'error': str(e)}
@@ -149,9 +171,19 @@ if page == "🔍 Single Abstract":
     with col1:
         user_title = st.text_input("Paper title:", placeholder="Attention is All You Need")
         user_abstract = st.text_area("Abstract:", height=200, placeholder="We propose a new architecture...")
+    with col2:
+        user_authors = st.number_input("Number of authors:", min_value=1, max_value=100, value=1)
+        user_category = st.selectbox("Category:", options=builder.metadata.categories or ["cs.LG"])
+        user_date = st.date_input("Submission date (optional):", value=None)
 
     if user_abstract.strip():
-        result = predict_from_abstract(user_title, user_abstract)
+        result = predict_from_abstract(
+            user_title,
+            user_abstract,
+            authors=int(user_authors),
+            category=user_category,
+            submitted_date=datetime.combine(user_date, datetime.min.time()) if user_date else None,
+        )
         if 'error' in result:
             st.error(f"Error: {result['error']}")
         else:
@@ -163,6 +195,11 @@ if page == "🔍 Single Abstract":
                 st.metric("Percentile Rank", f"{result['percentile']:.1f}%")
             with col3:
                 st.metric("95% CI", f"{result['conf_lower']:.0f}–{result['conf_upper']:.0f}")
+
+            if result.get('warnings'):
+                with st.expander("⚠️ Feature construction warnings"):
+                    for w in result['warnings']:
+                        st.write(f"- {w}")
 
             # Word analysis
             combined_lower = (user_title + " " + user_abstract).lower()
