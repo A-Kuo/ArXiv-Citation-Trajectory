@@ -8,6 +8,7 @@ Run with: streamlit run streamlit_app.py
 import pickle
 import re
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,8 @@ import streamlit as st
 from scipy import stats
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
+
+from feature_schema import load_builder_from_training_artifacts
 
 st.set_page_config(page_title="ArXiv Citation Analysis", layout="wide")
 st.title("📊 ArXiv Citation Prediction Dashboard")
@@ -45,6 +48,15 @@ def load_assets():
     lasso_coefs = models['lasso_coefs']
     feature_names = models['feature_names']
 
+    # Shared feature builder — constructs single-paper features the same
+    # way feature_engineering.py did at training time, so predictions here
+    # match the API and the trained model's expectations.
+    builder = load_builder_from_training_artifacts(
+        model_path=Path("lasso_model.pkl"),
+        vectorizer_path=Path("tfidf_vectorizer.pkl"),
+        validation_mode="warn",
+    )
+
     return {
         'features': features,
         'targets': targets,
@@ -54,6 +66,7 @@ def load_assets():
         'lasso': lasso_model,
         'lasso_coefs': lasso_coefs,
         'feature_names': feature_names,
+        'builder': builder,
     }
 
 try:
@@ -66,6 +79,7 @@ try:
     lasso_model = assets['lasso']
     lasso_coefs = assets['lasso_coefs']
     feature_names = assets['feature_names']
+    builder = assets['builder']
 except FileNotFoundError as e:
     st.error(f"❌ Missing required files. Please run the pipeline first:\n\n"
              f"1. `python feature_engineering.py` (or `--demo`)\n"
@@ -102,25 +116,27 @@ if page == "🔍 Abstract Analyzer":
             "Paper title (optional):",
             placeholder="Short title of your paper"
         )
+    with col2:
+        user_authors = st.number_input("Number of authors:", min_value=1, max_value=100, value=1)
+        user_category = st.selectbox("Category:", options=builder.metadata.categories or ["cs.LG"])
+        user_date = st.date_input("Submission date (optional):", value=None)
 
     if user_abstract.strip():
-        # Preprocess input
-        combined_text = (user_title if user_title else "") + " " + user_abstract
-
-        # Extract TF-IDF features
+        # Extract features using shared FeatureBuilder
         try:
-            tfidf_features = tfidf_vec.transform([combined_text])
-            tfidf_names = [f"tfidf_{name}" for name in tfidf_vec.get_feature_names_out()]
+            X_user, validation_log = builder.build_feature_vector(
+                title=user_title if user_title else "",
+                abstract=user_abstract,
+                authors=int(user_authors),
+                category=user_category,
+                submitted_date=datetime.combine(user_date, datetime.min.time()) if user_date else None,
+            )
+            warnings = [msg for level, msg in validation_log if level == "warning"]
 
-            # Create feature matrix (only TF-IDF, fill metadata with zeros/means)
-            X_user = np.zeros((1, len(feature_names)))
-            for i, fname in enumerate(feature_names):
-                if fname in tfidf_names:
-                    idx = tfidf_names.index(fname)
-                    X_user[0, i] = tfidf_features[0, idx]
-                elif fname not in tfidf_names and not fname.startswith("tfidf_"):
-                    # Use median/mode for metadata features we can't compute
-                    X_user[0, i] = features[fname].median() if fname in features.columns else 0.0
+            if warnings:
+                with st.expander("⚠️ Feature construction warnings"):
+                    for w in warnings:
+                        st.write(f"- {w}")
 
             # Scale and predict
             X_user_scaled = scaler.transform(X_user)
@@ -150,7 +166,9 @@ if page == "🔍 Abstract Analyzer":
             # Find and highlight words with LASSO coefficients
             st.markdown("#### Word-Level Contributions (LASSO Coefficients)")
 
+            combined_text = (user_title if user_title else "") + " " + user_abstract
             text_lower = combined_text.lower()
+            tfidf_names = [f"tfidf_{name}" for name in tfidf_vec.get_feature_names_out()]
             word_scores = {}
 
             for feat in tfidf_names:
