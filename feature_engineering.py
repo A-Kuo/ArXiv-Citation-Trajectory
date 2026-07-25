@@ -19,6 +19,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sqlalchemy import create_engine
 import textstat
 
+from feature_schema import FeatureBuilder, FeatureMetadata
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -269,6 +271,69 @@ class FeatureEngineer:
         logger.info("Feature engineering completed")
         return features, targets, arxiv_ids
 
+    def validate_feature_alignment(
+        self,
+        df: pd.DataFrame,
+        features: pd.DataFrame,
+        sample_size: int = 5,
+    ) -> Tuple[bool, str]:
+        """Verify training features match FeatureBuilder output.
+
+        Samples a few papers and checks that FeatureBuilder produces the
+        same feature values as the training path — a safety check to catch
+        divergence early (regression prevention).
+
+        Args:
+            df: original papers dataframe with submitted_date
+            features: extracted feature matrix
+            sample_size: number of random papers to validate
+
+        Returns:
+            (is_aligned, message) tuple
+        """
+        if not self.tfidf_vectorizer:
+            return True, "TF-IDF vectorizer not available; skipping validation"
+
+        try:
+            metadata = FeatureMetadata(
+                feature_names=list(features.columns),
+                categories=sorted(df["category"].unique().tolist()),
+            )
+            builder = FeatureBuilder(
+                metadata=metadata,
+                tfidf_vectorizer=self.tfidf_vectorizer,
+                validation_mode="warn",
+            )
+
+            # Sample papers randomly
+            sample_indices = np.random.choice(len(df), min(sample_size, len(df)), replace=False)
+
+            mismatches = []
+            for idx in sample_indices:
+                row = df.iloc[idx]
+                builder_vector, _ = builder.build_feature_vector(
+                    title=row["title"],
+                    abstract=row["abstract"],
+                    authors=row["authors"],
+                    category=row["category"],
+                    submitted_date=row["submitted_date"],
+                )
+                training_vector = features.iloc[idx].values
+
+                # Compare feature-by-feature (allow small numerical tolerance)
+                max_diff = np.max(np.abs(builder_vector[0] - training_vector))
+                if max_diff > 1e-5:
+                    mismatches.append(f"Paper {idx}: max feature diff = {max_diff:.2e}")
+
+            if mismatches:
+                msg = f"Feature alignment check FAILED:\n" + "\n".join(mismatches[:3])
+                return False, msg
+
+            return True, f"Feature alignment check PASSED ({sample_size} samples)"
+
+        except Exception as e:
+            return False, f"Feature alignment validation failed: {e}"
+
     def generate_report(self) -> str:
         """Generate comprehensive documentation report."""
         report = []
@@ -337,6 +402,20 @@ def main():
     engineer = FeatureEngineer()
 
     features, targets, arxiv_ids = engineer.run()
+
+    # Validate that training features match FeatureBuilder output (regression prevention)
+    logger.info("Validating feature alignment with FeatureBuilder...")
+    papers, _ = engineer.load_data()
+    df = engineer.merge_data(papers, _)
+    df = engineer.filter_data(df)
+    is_aligned, validation_msg = engineer.validate_feature_alignment(df, features, sample_size=10)
+    logger.info(validation_msg)
+    if not is_aligned:
+        logger.warning(
+            f"Feature alignment validation failed. This may indicate a "
+            f"divergence between feature_engineering.py and feature_schema.py. "
+            f"Details: {validation_msg}"
+        )
 
     output_dir = Path(".")
     features.to_parquet(output_dir / "features.parquet", index=False)
