@@ -26,3 +26,14 @@ fastapi>=0.100.0
 uvicorn>=0.23.0
 pydantic>=2.0.0
 httpx>=0.24.0  # For testing FastAPI endpoints
+
+# Phase 6 — RAG paper Q&A (retrieval + generation)
+rank-bm25>=0.2.2
+anthropic>=0.34.0            # generation (requires ANTHROPIC_API_KEY at call time)
+# sentence-transformers is optional: rag_embeddings.py falls back
+# automatically to an offline TF-IDF+SVD backend when it's absent or the
+# model hub is unreachable. Install it for real semantic embeddings:
+# sentence-transformers>=2.2.0
+# Vector search is brute-force numpy cosine similarity (fine at this
+# corpus scale); swap in faiss-cpu in rag_indexing.py if the index grows
+# past ~100k chunks and search latency becomes a problem.
