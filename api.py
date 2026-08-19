@@ -27,6 +27,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from feature_schema import FeatureBuilder, load_builder_from_training_artifacts
+from rag_indexing import RAGIndex
+from rag_retrieval import hybrid_search
+from rag_generation import generate_answer as rag_generate_answer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,6 +41,7 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = Path("lasso_model.pkl")
 FEATURES_PATH = Path("features.parquet")
 TFIDF_VECTORIZER_PATH = Path("tfidf_vectorizer.pkl")
+RAG_INDEX_DIR = Path("rag_index")
 
 app = FastAPI(
     title="ArXiv Citation Predictor API",
@@ -61,6 +65,15 @@ _MODEL_STATE = {
     "feature_names": None,
     "tfidf_vectorizer": None,
     "builder": None,
+    "ready": False,
+    "load_time": None,
+}
+
+# Global RAG index state — independent of the prediction model, so the
+# citation-prediction endpoints keep working even if no RAG index has been
+# built yet (and vice versa).
+_RAG_STATE = {
+    "index": None,
     "ready": False,
     "load_time": None,
 }
@@ -155,6 +168,54 @@ class HealthStatus(BaseModel):
     timestamp: str
 
 
+class RAGQuestionInput(BaseModel):
+    """A natural-language question to answer over the indexed papers."""
+    question: str = Field(..., min_length=3, max_length=1000, description="Question about the indexed papers")
+    top_k: int = Field(default=5, ge=1, le=20, description="Number of source chunks to retrieve")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "question": "What approaches have been proposed for transformer attention mechanisms?",
+                "top_k": 5,
+            }
+        }
+
+
+class RAGSourceOutput(BaseModel):
+    """A retrieved chunk, with its retrieval scores for transparency."""
+    index: int = Field(..., description="1-indexed position in the source list (matches [N] citations in the answer)")
+    arxiv_id: str
+    title: str
+    excerpt: str
+    bm25_score: Optional[float] = None
+    vector_score: Optional[float] = None
+    fused_score: Optional[float] = None
+
+
+class RAGSearchOutput(BaseModel):
+    """Hybrid search results, no LLM generation."""
+    question: str
+    sources: List[RAGSourceOutput]
+
+
+class RAGAnswerOutput(BaseModel):
+    """Generated answer with cited sources."""
+    question: str
+    answer: str
+    sources: List[RAGSourceOutput]
+    model: str
+
+
+class RAGIndexStatus(BaseModel):
+    """RAG index health/metadata."""
+    index_loaded: bool
+    index_path: str
+    n_chunks: int
+    embedding_backend: Optional[str] = None
+    timestamp: str
+
+
 # ============================================================================
 # Model Loading
 # ============================================================================
@@ -204,6 +265,58 @@ def ensure_model_loaded():
             status_code=503,
             detail="Model not ready. Call /model_info first or ensure lasso_model.pkl exists."
         )
+
+
+def load_rag_index():
+    """Load the RAG hybrid-search index, if one has been built.
+
+    Unlike load_model(), a missing index is expected on a fresh checkout —
+    it's only produced by running `python rag_indexing.py` — so this logs
+    at info level rather than error, and endpoints that need it return a
+    503 with instructions rather than the app failing to start.
+    """
+    try:
+        if not RAG_INDEX_DIR.exists():
+            logger.info(f"RAG index not found at {RAG_INDEX_DIR}; /rag endpoints will 503 until built")
+            _RAG_STATE["ready"] = False
+            return False
+
+        _RAG_STATE["index"] = RAGIndex.load(RAG_INDEX_DIR)
+        _RAG_STATE["ready"] = True
+        _RAG_STATE["load_time"] = datetime.now().isoformat()
+        logger.info(f"RAG index loaded: {len(_RAG_STATE['index'])} chunks from {RAG_INDEX_DIR}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load RAG index: {e}")
+        _RAG_STATE["ready"] = False
+        return False
+
+
+def ensure_rag_index_loaded():
+    """Raise exception if the RAG index is not loaded."""
+    if not _RAG_STATE["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"RAG index not ready. Build it with `python rag_indexing.py` "
+                f"(writes to {RAG_INDEX_DIR}) and restart the API."
+            ),
+        )
+
+
+def _retrieved_chunks_to_sources(chunks) -> List[RAGSourceOutput]:
+    return [
+        RAGSourceOutput(
+            index=i,
+            arxiv_id=c.arxiv_id,
+            title=c.title,
+            excerpt=c.text,
+            bm25_score=c.bm25_score,
+            vector_score=c.vector_score,
+            fused_score=c.fused_score,
+        )
+        for i, c in enumerate(chunks, start=1)
+    ]
 
 
 # ============================================================================
@@ -289,9 +402,11 @@ def predict_single(paper: PaperInput) -> PredictionOutput:
 
 @app.on_event("startup")
 async def startup_event():
-    """Load model on startup."""
+    """Load model and RAG index on startup."""
     logger.info("FastAPI startup: loading model...")
     load_model()
+    logger.info("FastAPI startup: loading RAG index...")
+    load_rag_index()
 
 
 @app.get("/health", response_model=HealthStatus)
@@ -395,6 +510,64 @@ async def batch_predict(batch: BatchPredictionInput, background_tasks: Backgroun
     )
 
 
+@app.get("/rag/status", response_model=RAGIndexStatus, tags=["RAG"])
+async def rag_status() -> RAGIndexStatus:
+    """Check whether the RAG paper index is built and loaded."""
+    index = _RAG_STATE["index"]
+    return RAGIndexStatus(
+        index_loaded=_RAG_STATE["ready"],
+        index_path=str(RAG_INDEX_DIR.absolute()),
+        n_chunks=len(index) if index is not None else 0,
+        embedding_backend=index.embedding_backend.name if index is not None else None,
+        timestamp=_RAG_STATE["load_time"] or datetime.now().isoformat(),
+    )
+
+
+@app.post("/rag/search", response_model=RAGSearchOutput, tags=["RAG"])
+async def rag_search(request: RAGQuestionInput) -> RAGSearchOutput:
+    """Hybrid (BM25 + vector) search over indexed papers — no LLM generation.
+
+    Useful for inspecting retrieval quality or building custom UIs without
+    incurring an LLM call.
+    """
+    ensure_rag_index_loaded()
+    try:
+        chunks = hybrid_search(_RAG_STATE["index"], request.question, top_k=request.top_k)
+        return RAGSearchOutput(
+            question=request.question,
+            sources=_retrieved_chunks_to_sources(chunks),
+        )
+    except Exception as e:
+        logger.error(f"RAG search failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Search failed: {str(e)}")
+
+
+@app.post("/rag/ask", response_model=RAGAnswerOutput, tags=["RAG"])
+async def rag_ask(request: RAGQuestionInput) -> RAGAnswerOutput:
+    """Answer a question about indexed papers: hybrid search + Claude-generated answer with citations.
+
+    Requires ANTHROPIC_API_KEY to be set in the environment.
+    """
+    ensure_rag_index_loaded()
+    try:
+        chunks = hybrid_search(_RAG_STATE["index"], request.question, top_k=request.top_k)
+        result = rag_generate_answer(request.question, chunks)
+        sources = _retrieved_chunks_to_sources(chunks)
+        logger.info(f"RAG answer generated for {request.question[:50]!r} using {len(chunks)} sources")
+        return RAGAnswerOutput(
+            question=result.question,
+            answer=result.answer,
+            sources=sources,
+            model=result.model,
+        )
+    except RuntimeError as e:
+        # Missing ANTHROPIC_API_KEY or similar configuration issue
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"RAG ask failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Answer generation failed: {str(e)}")
+
+
 @app.get("/", tags=["Info"])
 async def root():
     """Root endpoint with API documentation link."""
@@ -408,6 +581,9 @@ async def root():
             "batch_predict": "POST /batch_predict — multiple papers",
             "model_info": "GET /model_info — model metadata",
             "health": "GET /health — health check",
+            "rag_ask": "POST /rag/ask — ask a question, get an LLM answer with cited sources",
+            "rag_search": "POST /rag/search — hybrid search over indexed papers, no LLM call",
+            "rag_status": "GET /rag/status — RAG index health/metadata",
         }
     }
 
